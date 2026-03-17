@@ -1,0 +1,7 @@
+# Python dependencies
+torch>=1.12.0
+torchtext>=0.13.0
+pandas>=1.4.0
+numpy>=1.22.0
+scikit-learn>=1.0.0
+flask>=2.0.0
