@@ -11,7 +11,7 @@ CORS(app)
 
 # 1) Use the processed split (label column exists)
 TRAIN_CSV     = "train_split.csv"            # <- changed
-CHECKPOINT    = "checkpoints/bilstm_e1.pt"   # or your best checkpoint
+CHECKPOINT    = "checkpoints/best_model.pt"
 EMBEDDING_DIM = 100
 HIDDEN_DIM    = 128
 DROPOUT       = 0.5
@@ -29,6 +29,10 @@ model = BiLSTM(
     dropout=DROPOUT,
     pad_idx=pad_idx
 )
+if not os.path.exists(CHECKPOINT):
+    raise FileNotFoundError(
+        f"Checkpoint not found: {CHECKPOINT}. Train first to create best_model.pt."
+    )
 model.load_state_dict(torch.load(CHECKPOINT, map_location='cpu'))
 model.eval()
 

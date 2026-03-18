@@ -4,10 +4,48 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 from utils import FakeNewsDataset
 from models import BiLSTM, CNN
+
+
+def evaluate(model, loader, criterion, device, model_name):
+    model.eval()
+    total_loss = 0.0
+    y_true, y_pred = [], []
+
+    with torch.no_grad():
+        for title, text, label in loader:
+            title, text, label = title.to(device), text.to(device), label.to(device)
+            out = model(title, text) if model_name == 'bilstm' else model(text)
+            loss = criterion(out, label)
+            total_loss += loss.item() * label.size(0)
+
+            preds = torch.argmax(out, dim=1)
+            y_true.extend(label.cpu().tolist())
+            y_pred.extend(preds.cpu().tolist())
+
+    avg_loss = total_loss / len(loader.dataset)
+    acc = accuracy_score(y_true, y_pred)
+    p_macro, r_macro, f1_macro, _ = precision_recall_fscore_support(
+        y_true, y_pred, average='macro', zero_division=0
+    )
+    p_real, r_real, f1_real, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=[0], average='binary', zero_division=0
+    )
+
+    return {
+        'loss': avg_loss,
+        'accuracy': acc,
+        'precision_macro': p_macro,
+        'recall_macro': r_macro,
+        'f1_macro': f1_macro,
+        'precision_real': p_real,
+        'recall_real': r_real,
+        'f1_real': f1_real,
+    }
 
 def main():
     p = argparse.ArgumentParser()
@@ -28,18 +66,27 @@ def main():
     p.add_argument('--max_title_len', type=int, default=20,
                    help="Max tokens in title")
     p.add_argument('--checkpoint_dir',type=str, default='checkpoints')
+    p.add_argument('--patience',      type=int, default=3,
+                   help="Early stopping patience based on val macro-F1")
     args = p.parse_args()
 
     # 1) Load and sample
     df = pd.read_csv(args.data_file)
     df = df.sample(frac=args.sample_frac, random_state=42).reset_index(drop=True)
-    if 'type' not in df.columns:
-        raise KeyError("CSV must contain a 'type' column")
-    df = df.rename(columns={'type':'label'})
+    if 'type' in df.columns:
+        df = df.rename(columns={'type':'label'})
+    elif 'label' not in df.columns:
+        raise KeyError("CSV must contain either a 'type' or 'label' column")
 
     # 2) Map categories to 0/1
     fake_types = {'fake','bs','satire','junksci','conspiracy','hate'}
-    df['label'] = df['label'].apply(lambda x: 1 if x in fake_types else 0)
+
+    def map_label(v):
+        if str(v).strip() in {'0', '1'}:
+            return int(v)
+        return 1 if str(v).strip().lower() in fake_types else 0
+
+    df['label'] = df['label'].apply(map_label)
     df = df[['title','text','label']].dropna()
 
     # 3) Split
@@ -76,14 +123,25 @@ def main():
                     args.dropout, pad_idx)
     model.to(device)
 
-    crit = nn.CrossEntropyLoss()
+    class_counts = train_df['label'].value_counts().to_dict()
+    total = len(train_df)
+    # Inverse-frequency weights reduce bias toward the dominant class.
+    w0 = total / (2.0 * class_counts.get(0, 1))
+    w1 = total / (2.0 * class_counts.get(1, 1))
+    class_weights = torch.tensor([w0, w1], dtype=torch.float).to(device)
+
+    crit = nn.CrossEntropyLoss(weight=class_weights)
     opt  = optim.Adam(model.parameters(), lr=args.learning_rate)
     os.makedirs(args.checkpoint_dir, exist_ok=True)
+    best_ckpt = os.path.join(args.checkpoint_dir, 'best_model.pt')
+    best_f1 = -1.0
+    epochs_no_improve = 0
 
     # 6) Train
     for epoch in range(1, args.epochs+1):
         model.train()
         running_loss = 0.0
+        seen = 0
 
         for i, (title, text, label) in enumerate(tl, 1):
             title, text, label = title.to(device), text.to(device), label.to(device)
@@ -93,17 +151,42 @@ def main():
             loss.backward()
             opt.step()
 
-            running_loss += loss.item()
+            running_loss += loss.item() * label.size(0)
+            seen += label.size(0)
             if i % 50 == 0:
-                avg = running_loss / 50
+                avg = running_loss / max(seen, 1)
                 print(f"[Epoch {epoch}] Batch {i}/{len(tl)}  Loss: {avg:.4f}")
                 running_loss = 0.0
+                seen = 0
 
         # Save checkpoint each epoch
         ckpt = os.path.join(args.checkpoint_dir, f"{args.model}_e{epoch}.pt")
         torch.save(model.state_dict(), ckpt)
 
-    print("✅ Training complete.")
+        val_metrics = evaluate(model, vl, crit, device, args.model)
+        print(
+            f"[Epoch {epoch}] "
+            f"ValLoss: {val_metrics['loss']:.4f}  "
+            f"Acc: {val_metrics['accuracy']:.4f}  "
+            f"MacroF1: {val_metrics['f1_macro']:.4f}  "
+            f"RealRecall: {val_metrics['recall_real']:.4f}"
+        )
+
+        if val_metrics['f1_macro'] > best_f1:
+            best_f1 = val_metrics['f1_macro']
+            epochs_no_improve = 0
+            torch.save(model.state_dict(), best_ckpt)
+            print(f"✅ New best checkpoint saved: {best_ckpt} (MacroF1={best_f1:.4f})")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= args.patience:
+                print(
+                    f"⏹ Early stopping at epoch {epoch} "
+                    f"(no macro-F1 improvement for {args.patience} epochs)."
+                )
+                break
+
+    print(f"✅ Training complete. Best model: {best_ckpt} (MacroF1={best_f1:.4f})")
 
 if __name__ == '__main__':
     main()
