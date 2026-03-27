@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Python cache/virtual env
+.venv/
+__pycache__/
+*.py[cod]
+
+# Training artifacts
+checkpoints/
+train_split.csv
+val_split.csv
+
+# Data archives and local datasets
+*.zip
+
+# Frontend dependencies/build artifacts
+frontend/node_modules/
+frontend/build/
+frontend/.cache/
+
+# Logs
+*.log
