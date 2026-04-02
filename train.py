@@ -1,5 +1,6 @@
 import os
 import argparse
+import json
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -7,7 +8,7 @@ import torch.optim as optim
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
-from utils import FakeNewsDataset
+from utils import FakeNewsDataset, fetch_rss_articles
 from models import BiLSTM, CNN
 
 
@@ -47,6 +48,49 @@ def evaluate(model, loader, criterion, device, model_name):
         'f1_real': f1_real,
     }
 
+
+def evaluate_thresholds(model, loader, device, model_name, min_real_recall=0.95):
+    model.eval()
+    y_true, fake_probs = [], []
+
+    with torch.no_grad():
+        for title, text, label in loader:
+            title, text = title.to(device), text.to(device)
+            out = model(title, text) if model_name == 'bilstm' else model(text)
+            probs = torch.softmax(out, dim=1)[:, 1].cpu().tolist()
+            fake_probs.extend(probs)
+            y_true.extend(label.tolist())
+
+    best_threshold = 0.5
+    best_score = (-1.0, -1.0, -1.0)
+    fallback_threshold = 0.5
+    fallback_score = (-1.0, -1.0, -1.0)
+    for threshold in [i / 100 for i in range(20, 91)]:
+        y_pred = [1 if score >= threshold else 0 for score in fake_probs]
+        _, r_macro, f1_macro, _ = precision_recall_fscore_support(
+            y_true, y_pred, average='macro', zero_division=0
+        )
+        _, recall_real, _, _ = precision_recall_fscore_support(
+            y_true, y_pred, pos_label=0, average='binary', zero_division=0
+        )
+        score = (recall_real, f1_macro, r_macro)
+        if score > fallback_score:
+            fallback_score = score
+            fallback_threshold = threshold
+        if recall_real >= min_real_recall and score > best_score:
+            best_score = score
+            best_threshold = threshold
+
+    if best_score[0] < 0:
+        best_threshold = fallback_threshold
+        best_score = fallback_score
+
+    return best_threshold, {
+        'real_recall': best_score[0],
+        'macro_f1': best_score[1],
+        'macro_recall': best_score[2],
+    }
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--model', choices=['bilstm','cnn'], required=True)
@@ -68,6 +112,19 @@ def main():
     p.add_argument('--checkpoint_dir',type=str, default='checkpoints')
     p.add_argument('--patience',      type=int, default=3,
                    help="Early stopping patience based on val macro-F1")
+    p.add_argument('--augment_real_web', action='store_true',
+                   help="Add public RSS real-news examples to the training split")
+    p.add_argument('--real_feed_urls', nargs='*', default=[
+        'https://feeds.reuters.com/reuters/topNews',
+        'https://feeds.reuters.com/reuters/worldNews',
+        'https://www.npr.org/rss/rss.php?id=1001',
+        'https://www.npr.org/rss/rss.php?id=1003',
+    ],
+                   help="RSS feeds to use when augmenting real-news examples")
+    p.add_argument('--real_feed_limit', type=int, default=25,
+                   help="Max articles to ingest from each RSS feed")
+    p.add_argument('--threshold_min_real_recall', type=float, default=0.95,
+                   help="Preferred minimum recall for real news when calibrating inference")
     args = p.parse_args()
 
     # 1) Load and sample
@@ -93,6 +150,17 @@ def main():
     train_df, val_df = train_test_split(
         df, test_size=0.2, random_state=42, stratify=df['label']
     )
+
+    if args.augment_real_web:
+        rss_rows = fetch_rss_articles(args.real_feed_urls, limit_per_feed=args.real_feed_limit)
+        if rss_rows:
+            rss_df = pd.DataFrame(rss_rows)
+            train_df = pd.concat([train_df, rss_df], ignore_index=True)
+            train_df = train_df.sample(frac=1.0, random_state=42).reset_index(drop=True)
+            print(f"✅ Added {len(rss_df)} public RSS real-news examples to training data")
+        else:
+            print("⚠️ No RSS articles were fetched; continuing without web augmentation")
+
     train_df.to_csv('train_split.csv', index=False)
     val_df.to_csv('val_split.csv',   index=False)
 
@@ -186,35 +254,34 @@ def main():
                 )
                 break
 
+    best_threshold, threshold_metrics = evaluate_thresholds(
+        model, vl, device, args.model, min_real_recall=args.threshold_min_real_recall
+    )
+    threshold_path = os.path.join(args.checkpoint_dir, 'inference_config.json')
+    with open(threshold_path, 'w', encoding='utf-8') as f:
+        json.dump({
+            'fake_threshold': best_threshold,
+            'threshold_min_real_recall': args.threshold_min_real_recall,
+            'validation_real_recall': threshold_metrics['real_recall'],
+            'validation_macro_f1': threshold_metrics['macro_f1'],
+        }, f, indent=2)
+    print(
+        f"✅ Calibrated fake threshold: {best_threshold:.2f} "
+        f"(real recall={threshold_metrics['real_recall']:.4f}, macro F1={threshold_metrics['macro_f1']:.4f})"
+    )
+    print(f"✅ Saved inference config: {threshold_path}")
     print(f"✅ Training complete. Best model: {best_ckpt} (MacroF1={best_f1:.4f})")
 
 if __name__ == '__main__':
     main()
  
-#To Train:  
-""" 
- python train.py \
-  --model bilstm \
-  --data_file data/train.csv \
-  --sample_frac 1.0 \
-  --max_seq_len 500 \
-  --max_title_len 30 \
-  --epochs 10 \
-  --batch_size 32
-"""
-
-# To Run:
-"""
-export FLASK_APP=app.py
-flask run --host=0.0.0.0 --port=80
-"""
-
-#In another terminal run"
-"""
-curl -X POST http://localhost:5000/predict \
-  -H "Content-Type: application/json" \
-  -d '{
-        "title":"City Council Approves New Community Garden",
-        "text":"The city council voted unanimously yesterday to fund the construction of a new community garden set to open this spring, offering free workshops and local produce stands."
-      }'
-"""
+# Example retraining command:
+# python train.py \
+#   --model bilstm \
+#   --data_file data/train.csv \
+#   --sample_frac 1.0 \
+#   --max_seq_len 500 \
+#   --max_title_len 30 \
+#   --epochs 10 \
+#   --batch_size 32 \
+#   --augment_real_web

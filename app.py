@@ -1,4 +1,5 @@
 import os
+import json
 import torch
 import torch.nn.functional as F
 from flask import Flask, request, jsonify, send_from_directory
@@ -12,16 +13,21 @@ CORS(app)
 # 1) Use the processed split (label column exists)
 TRAIN_CSV     = "train_split.csv"            # <- changed
 CHECKPOINT    = "checkpoints/best_model.pt"
+INFERENCE_CFG  = "checkpoints/inference_config.json"
 EMBEDDING_DIM = 100
 HIDDEN_DIM    = 128
 DROPOUT       = 0.5
 
-# 2) Build vocab from the TRAIN split (which has title,text,label)
-dummy_ds = FakeNewsDataset(TRAIN_CSV, build_vocab=True)
+# 2) Load checkpoint to get expected vocab size
+checkpoint_state = torch.load(CHECKPOINT, map_location='cpu')
+expected_vocab_size = checkpoint_state['embedding.weight'].shape[0]
+
+# 3) Build vocab from the TRAIN split, then limit to checkpoint size
+dummy_ds = FakeNewsDataset(TRAIN_CSV, build_vocab=True, max_vocab_size=expected_vocab_size)
 vocab    = dummy_ds.vocab
 pad_idx  = vocab['<PAD>']
 
-# 3) Load the model
+# 4) Load the model
 model = BiLSTM(
     vocab_size=len(vocab),
     embedding_dim=EMBEDDING_DIM,
@@ -33,8 +39,14 @@ if not os.path.exists(CHECKPOINT):
     raise FileNotFoundError(
         f"Checkpoint not found: {CHECKPOINT}. Train first to create best_model.pt."
     )
-model.load_state_dict(torch.load(CHECKPOINT, map_location='cpu'))
+model.load_state_dict(checkpoint_state)
 model.eval()
+
+fake_threshold = 0.5
+if os.path.exists(INFERENCE_CFG):
+    with open(INFERENCE_CFG, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+    fake_threshold = float(config.get('fake_threshold', fake_threshold))
 
 # 4) Inference helper
 def preprocess(title: str, text: str):
@@ -60,9 +72,11 @@ def predict():
     with torch.no_grad():
         logits = model(h, x)
         probs  = F.softmax(logits, dim=1).squeeze().tolist()
-    label = "fake" if probs[1] > probs[0] else "real"
-    score = probs[1] if label=="fake" else probs[0]
-    return jsonify(label=label, score=score)
+    fake_score = probs[1]
+    real_score = probs[0]
+    label = "fake" if fake_score >= fake_threshold else "real"
+    score = fake_score if label == "fake" else real_score
+    return jsonify(label=label, score=score, fake_score=fake_score, real_score=real_score, threshold=fake_threshold)
 
 if __name__ == '__main__':
     # Default to a non-privileged port; override with PORT env var when needed.
