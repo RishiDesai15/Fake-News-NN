@@ -9,8 +9,8 @@ const SAMPLE_ARTICLES = [
   },
   {
     name: "Fake-style sample",
-    title: "Scientists Furious About One Secret Trick",
-    text: "A shocking secret has been hidden from the public for years. Experts do not want you to know this one simple trick that changes everything overnight. Industry insiders are panicking and trying to bury the truth.",
+    title: "Shocking Leak Reveals Election Results Were Prewritten",
+    text: "An anonymous post alleges election outcomes were scripted months in advance. The article relies on edited clips, misquoted officials, and dramatic language, while offering no direct evidence that can be independently verified.",
   },
 ];
 
